@@ -1,0 +1,24 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+  packages: write
+jobs:
+  dco:
+    if: github.event_name == 'pull_request'
+    uses: cloudsmith-cloud/cloudsmith-workflows/.github/workflows/dco-check.yml@v1.0.0
+  build-test:
+    uses: cloudsmith-cloud/cloudsmith-workflows/.github/workflows/dotnet-build-test.yml@v1.0.0
+    secrets: inherit
+  pack:
+    if: github.ref == 'refs/heads/main'
+    needs: [build-test]
+    uses: cloudsmith-cloud/cloudsmith-workflows/.github/workflows/dotnet-pack-publish.yml@v1.0.0
+    with:
+      package-id: CloudSmith.Cli
+      pre-release: true
+    secrets: inherit
