@@ -1,0 +1,25 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+TestResults/
+publish/
+
+## NuGet
+*.nupkg
+*.snupkg
+packages/
+
+## OS
+.DS_Store
+Thumbs.db
+
+## Rider / VS Code
+.idea/
+.vscode/
+*.DotSettings.user
+
+## CloudSmith CLI — never commit token/config files
+~/.cloudsmith/
