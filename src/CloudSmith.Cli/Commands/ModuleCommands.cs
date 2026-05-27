@@ -1,6 +1,7 @@
 using System.CommandLine;
 using System.Text;
 using System.Text.Json;
+using CloudSmith.Cli.Commands.Module;
 using CloudSmith.Cli.Output;
 using CloudSmith.Cli.Services;
 
@@ -8,6 +9,9 @@ namespace CloudSmith.Cli.Commands;
 
 public static class ModuleCommands
 {
+    private static readonly JsonSerializerOptions JsonOpts =
+        new() { PropertyNameCaseInsensitive = true };
+
     public static Command Build(IConfigService configService, IAuthService authService)
     {
         Command module = new("module", "Manage CloudSmith modules.");
@@ -17,6 +21,9 @@ public static class ModuleCommands
         module.AddCommand(BuildUninstall(configService, authService));
         module.AddCommand(BuildEnable(configService, authService));
         module.AddCommand(BuildDisable(configService, authService));
+
+        // AB#1925 — published module catalog
+        module.AddCommand(CatalogCommands.Build(configService, authService));
 
         return module;
     }
@@ -51,8 +58,7 @@ public static class ModuleCommands
                     return;
                 }
 
-                var modules = JsonSerializer.Deserialize<List<ModuleDto>>(body,
-                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? [];
+                var modules = JsonSerializer.Deserialize<List<ModuleDto>>(body, JsonOpts) ?? [];
 
                 var table = new Spectre.Console.Table()
                     .AddColumn("Id")
@@ -80,38 +86,103 @@ public static class ModuleCommands
     }
 
     // -------------------------------------------------------------------------
-    // cs module install <id> [--version x.y.z]
+    // cs module install <id> [--version x.y.z] [--from-catalog]
     // -------------------------------------------------------------------------
     private static Command BuildInstall(IConfigService configService, IAuthService authService)
     {
         Command install = new("install", "Install a module.");
 
-        Argument<string> idArg      = new("id", "Module ID.");
-        Option<string?>  versionOpt = new("--version", "Version to install.");
+        Argument<string> idArg          = new("id", "Module ID.");
+        Option<string?>  versionOpt     = new("--version", "Version to install.");
+        Option<bool>     fromCatalogOpt = new("--from-catalog",
+            "Look up the module in the published catalog before installing; prompts if not verified.");
 
         install.AddArgument(idArg);
         install.AddOption(versionOpt);
+        install.AddOption(fromCatalogOpt);
 
-        install.SetHandler(async (string id, string? version, string? serverOverride, string output) =>
+        install.SetHandler(async (string id, string? version, bool fromCatalog,
+            string? serverOverride, string output) =>
         {
             string server = serverOverride ?? configService.Get("server") ?? "https://localhost";
             using System.Net.Http.HttpClient http = ClusterCommands.MakeClient(server, authService);
 
             try
             {
-                var payload = version is not null ? new { id, version } : (object)new { id };
+                // --from-catalog: lookup entry, warn if unverified, then install
+                if (fromCatalog)
+                {
+                    System.Net.Http.HttpResponseMessage catalogResponse =
+                        await http.GetAsync("api/v1/modules/catalog");
+                    string catalogBody = await catalogResponse.Content.ReadAsStringAsync();
+
+                    if (!catalogResponse.IsSuccessStatusCode)
+                    {
+                        OutputWriter.WriteError(
+                            $"Catalog lookup failed {(int)catalogResponse.StatusCode}: {catalogBody}");
+                        Environment.Exit(1);
+                        return;
+                    }
+
+                    CatalogResponse? catalog =
+                        JsonSerializer.Deserialize<CatalogResponse>(catalogBody, JsonOpts);
+                    CatalogEntry? entry = catalog?.Items.FirstOrDefault(
+                        e => string.Equals(e.Id, id, StringComparison.OrdinalIgnoreCase));
+
+                    if (entry is null)
+                    {
+                        OutputWriter.WriteError(
+                            $"Module '{id}' not found in the published catalog.");
+                        Environment.Exit(1);
+                        return;
+                    }
+
+                    // Use catalog version if no explicit version supplied
+                    version ??= entry.Version;
+
+                    if (!entry.IsVerified)
+                    {
+                        Spectre.Console.AnsiConsole.MarkupLine(
+                            "[yellow]Warning:[/] Module is not cosign-verified. Install anyway? [y/N] ");
+                        string? answer = Console.ReadLine();
+                        if (!string.Equals(answer?.Trim(), "y",
+                            StringComparison.OrdinalIgnoreCase))
+                        {
+                            OutputWriter.WriteMessage(output, "Aborted.");
+                            return;
+                        }
+                    }
+                }
+
+                // POST /api/v1/modules/{id}/install
+                var payload = version is not null ? (object)new { version } : new { };
                 string json = JsonSerializer.Serialize(payload);
                 using StringContent content = new(json, Encoding.UTF8, "application/json");
 
                 System.Net.Http.HttpResponseMessage response =
-                    await http.PostAsync("api/v1/modules/install", content);
+                    await http.PostAsync(
+                        $"api/v1/modules/{Uri.EscapeDataString(id)}/install", content);
                 string body = await response.Content.ReadAsStringAsync();
 
                 if (!response.IsSuccessStatusCode)
                 {
-                    OutputWriter.WriteError($"API error {(int)response.StatusCode}: {body}");
-                    Environment.Exit(1);
-                    return;
+                    // Fall back to legacy endpoint for backward compatibility
+                    var legacyPayload = version is not null
+                        ? (object)new { id, version }
+                        : new { id };
+                    string legacyJson = JsonSerializer.Serialize(legacyPayload);
+                    using StringContent legacyContent =
+                        new(legacyJson, Encoding.UTF8, "application/json");
+
+                    response = await http.PostAsync("api/v1/modules/install", legacyContent);
+                    body     = await response.Content.ReadAsStringAsync();
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        OutputWriter.WriteError($"API error {(int)response.StatusCode}: {body}");
+                        Environment.Exit(1);
+                        return;
+                    }
                 }
 
                 if (output.Equals("json", StringComparison.OrdinalIgnoreCase))
@@ -120,17 +191,28 @@ public static class ModuleCommands
                     return;
                 }
 
-                var m = JsonSerializer.Deserialize<ModuleDto>(body,
-                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                // Try to deserialize as ModuleDto to extract name/version for the message
+                ModuleDto? m = null;
+                try
+                {
+                    m = JsonSerializer.Deserialize<ModuleDto>(body, JsonOpts);
+                }
+                catch { /* not a ModuleDto — that's fine */ }
 
-                OutputWriter.WriteMessage(output, $"Module '{m?.Name ?? id}' installed successfully.");
+                string displayName    = m?.Name    ?? id;
+                string displayVersion = m?.Version ?? version ?? "";
+
+                string versionSuffix = displayVersion.Length > 0 ? $" v{displayVersion}" : "";
+                Spectre.Console.AnsiConsole.MarkupLine(
+                    $"[green]checkmark[/]  Module '[bold]{Spectre.Console.Markup.Escape(displayName)}[/]'" +
+                    $"{Spectre.Console.Markup.Escape(versionSuffix)} queued for installation.");
             }
             catch (Exception ex)
             {
                 OutputWriter.WriteError($"Request failed: {ex.Message}");
                 Environment.Exit(1);
             }
-        }, idArg, versionOpt, CommandBase.ServerOption, CommandBase.OutputOption);
+        }, idArg, versionOpt, fromCatalogOpt, CommandBase.ServerOption, CommandBase.OutputOption);
 
         return install;
     }
@@ -190,7 +272,8 @@ public static class ModuleCommands
 
         enable.SetHandler(async (string id, string? serverOverride, string output) =>
         {
-            await PatchModuleState(id, "enable", server: serverOverride ?? configService.Get("server") ?? "https://localhost",
+            await PatchModuleState(id, "enable",
+                server: serverOverride ?? configService.Get("server") ?? "https://localhost",
                 authService, output);
         }, idArg, CommandBase.ServerOption, CommandBase.OutputOption);
 
@@ -209,7 +292,8 @@ public static class ModuleCommands
 
         disable.SetHandler(async (string id, string? serverOverride, string output) =>
         {
-            await PatchModuleState(id, "disable", server: serverOverride ?? configService.Get("server") ?? "https://localhost",
+            await PatchModuleState(id, "disable",
+                server: serverOverride ?? configService.Get("server") ?? "https://localhost",
                 authService, output);
         }, idArg, CommandBase.ServerOption, CommandBase.OutputOption);
 
