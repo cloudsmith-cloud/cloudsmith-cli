@@ -1,3 +1,6 @@
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
 using CloudSmith.Cli.Services;
 using Xunit;
 
@@ -6,6 +9,7 @@ namespace CloudSmith.Cli.Tests;
 /// <summary>
 /// AB#1523 — auth login: token written to cache.
 /// AB#1524 — auth logout: cache cleared, revocation attempted.
+/// H3      — token cache must never be written as plaintext on any platform.
 /// </summary>
 public class AuthTests
 {
@@ -213,5 +217,124 @@ public class AuthTests
             if (File.Exists(tokenPath))  File.Delete(tokenPath);
             if (File.Exists(configPath)) File.Delete(configPath);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // H3 — No plaintext on any platform
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// The on-disk file must not contain the raw access token string as UTF-8
+    /// plaintext. On Windows DPAPI encrypts it; on Linux/macOS AES-GCM does.
+    /// Either way the raw token value must not appear verbatim in the file.
+    /// </summary>
+    [Fact]
+    public void TokenCache_FileDoesNotContainPlaintextToken()
+    {
+        string path = TempTokenPath();
+        try
+        {
+            TokenCacheService cache = MakeCache(path);
+
+            const string sentinel = "super-secret-access-token-h3-check";
+
+            cache.Save(new CachedToken
+            {
+                Upn          = "u@example.com",
+                AccessToken  = sentinel,
+                RefreshToken = "refresh-value-that-must-not-appear",
+                ExpiresOn    = DateTimeOffset.UtcNow.AddHours(1),
+                Server       = "https://srv"
+            });
+
+            Assert.True(File.Exists(path));
+
+            byte[] rawBytes   = File.ReadAllBytes(path);
+            byte[] sentinelBytes = Encoding.UTF8.GetBytes(sentinel);
+
+            // The raw bytes of the file must not contain the plaintext token.
+            bool containsPlaintext = ContainsSubsequence(rawBytes, sentinelBytes);
+            Assert.False(containsPlaintext,
+                "Token cache file must not contain the access token as plaintext bytes.");
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+            // Clean up the .nokeyring sentinel if it was created
+            if (File.Exists(path + ".nokeyring")) File.Delete(path + ".nokeyring");
+        }
+    }
+
+    /// <summary>
+    /// On non-Windows platforms the file fallback must not persist the refresh
+    /// token at all, because the refresh token grants indefinite re-authentication.
+    /// The loaded CachedToken should have a null RefreshToken.
+    /// </summary>
+    [Fact]
+    public void TokenCache_NonWindows_RefreshTokenNotPersistedInFile()
+    {
+        // This test is only meaningful on non-Windows; on Windows DPAPI
+        // is used and the full token can be stored securely.
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            return;
+
+        string path = TempTokenPath();
+        try
+        {
+            TokenCacheService cache = MakeCache(path);
+
+            cache.Save(new CachedToken
+            {
+                Upn          = "u@example.com",
+                AccessToken  = "at",
+                RefreshToken = "rt-must-not-survive-roundtrip",
+                ExpiresOn    = DateTimeOffset.UtcNow.AddHours(1),
+                Server       = "https://srv"
+            });
+
+            CachedToken? loaded = cache.Load();
+
+            Assert.NotNull(loaded);
+            Assert.Null(loaded!.RefreshToken);
+            Assert.Equal("at", loaded.AccessToken);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+            if (File.Exists(path + ".nokeyring")) File.Delete(path + ".nokeyring");
+        }
+    }
+
+    /// <summary>
+    /// Verifies that DeriveFileKey returns 32 bytes (AES-256) and is
+    /// deterministic — same machine + user produces the same key.
+    /// </summary>
+    [Fact]
+    public void DeriveFileKey_Returns32BytesDeterministic()
+    {
+        byte[] key1 = TokenCacheService.DeriveFileKey();
+        byte[] key2 = TokenCacheService.DeriveFileKey();
+
+        Assert.Equal(32, key1.Length);
+        Assert.Equal(key1, key2);
+    }
+
+    // -------------------------------------------------------------------------
+    // Private helpers
+    // -------------------------------------------------------------------------
+
+    private static bool ContainsSubsequence(byte[] haystack, byte[] needle)
+    {
+        if (needle.Length == 0) return true;
+        for (int i = 0; i <= haystack.Length - needle.Length; i++)
+        {
+            bool match = true;
+            for (int j = 0; j < needle.Length; j++)
+            {
+                if (haystack[i + j] != needle[j]) { match = false; break; }
+            }
+            if (match) return true;
+        }
+        return false;
     }
 }
