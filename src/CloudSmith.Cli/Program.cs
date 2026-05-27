@@ -26,6 +26,11 @@ root.AddGlobalOption(CommandBase.VerboseOption);
 // ---------------------------------------------------------------------------
 root.AddCommand(AuthCommands.Build(authService, configService));
 root.AddCommand(ConfigCommands.Build(configService));
+root.AddCommand(ClusterCommands.Build(configService, authService));
+root.AddCommand(DeployCommands.Build(configService, authService));
+root.AddCommand(ModuleCommands.Build(configService, authService));
+root.AddCommand(AgentCommands.Build(configService, authService));
+root.AddCommand(WatchCommand.Build(configService, authService));
 
 // ---------------------------------------------------------------------------
 // Pipeline with defaults (--help, --version, error handling)
