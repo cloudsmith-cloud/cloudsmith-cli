@@ -30,6 +30,7 @@ root.AddCommand(ClusterCommands.Build(configService, authService));
 root.AddCommand(DeployCommands.Build(configService, authService));
 root.AddCommand(ModuleCommands.Build(configService, authService));
 root.AddCommand(AgentCommands.Build(configService, authService));
+root.AddCommand(PlatformCommands.Build(configService, authService));
 root.AddCommand(WatchCommand.Build(configService, authService));
 
 // ---------------------------------------------------------------------------
