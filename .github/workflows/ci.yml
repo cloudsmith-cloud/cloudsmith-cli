@@ -2,6 +2,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*.*.*']
   pull_request:
     branches: [main]
 permissions:
@@ -22,3 +23,68 @@ jobs:
       package-id: CloudSmith.Cli
       pre-release: true
     secrets: inherit
+  publish-release:
+    name: Publish release to GitHub Packages
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.x'
+
+      - name: Add GitHub Packages source
+        run: |
+          dotnet nuget add source \
+            "https://nuget.pkg.github.com/cloudsmith-cloud/index.json" \
+            --name github \
+            --username "${{ github.actor }}" \
+            --password "${{ secrets.GITHUB_TOKEN }}" \
+            --store-password-in-clear-text
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Pack NuGet tool package
+        run: |
+          dotnet pack src/CloudSmith.Cli/CloudSmith.Cli.csproj \
+            --configuration Release \
+            /p:Version=${{ steps.version.outputs.VERSION }} \
+            --output ./artifacts/nuget
+
+      - name: Publish to GitHub Packages
+        run: |
+          dotnet nuget push ./artifacts/nuget/*.nupkg \
+            --source github \
+            --api-key "${{ secrets.GITHUB_TOKEN }}" \
+            --skip-duplicate
+
+      - name: Build self-contained executables
+        run: |
+          for rid in win-x64 linux-x64 osx-x64; do
+            dotnet publish src/CloudSmith.Cli/CloudSmith.Cli.csproj \
+              --configuration Release \
+              --runtime "$rid" \
+              --self-contained true \
+              /p:PublishSingleFile=true \
+              /p:Version=${{ steps.version.outputs.VERSION }} \
+              --output "./artifacts/bin/$rid"
+          done
+
+      - name: Upload binaries as release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/bin/win-x64/cs.exe
+            artifacts/bin/linux-x64/cs
+            artifacts/bin/osx-x64/cs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
