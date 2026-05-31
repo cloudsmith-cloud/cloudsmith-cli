@@ -31,6 +31,10 @@ public static class PlatformUpdateCommands
     {
         Command update = new("update", "Check, apply, or roll back a platform update.");
 
+        // AB#1951 — named subcommands: cs platform update check / apply
+        update.AddCommand(PlatformUpdateCheckCommand.Build(configService, authService));
+        update.AddCommand(PlatformUpdateApplyCommand.Build(configService, authService));
+
         Option<bool> checkOpt    = new("--check",    "Check for available updates (default).");
         Option<bool> applyOpt    = new("--apply",    "Download and apply the latest update.");
         Option<bool> rollbackOpt = new("--rollback", "Roll back to the previous platform version.");
